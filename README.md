@@ -1,6 +1,6 @@
 # WorkTrack Backend — demo chấm công, không đăng nhập
 
-Dùng source `work-track_be` và 10 bảng MySQL đã tạo. Không chạy `migrate`, không import lại schema/seed khi khởi động. Models là `managed=False`; MySQL giữ FK/CHECK và các cột generated. SQLite cũ không còn được sử dụng.
+Dùng source `work-track_be` với MySQL. Django migration `attendance.0001_initial` tạo cấu trúc 10 bảng trong database trống hoặc kiểm tra rồi ghi nhận schema hiện có. Không import lại schema/seed khi khởi động. Models hiện vẫn `managed=False`; các ràng buộc MySQL và cột generated được giữ trong baseline SQL đóng băng của migration. SQLite không được hỗ trợ.
 
 ## Khởi động trên máy hiện tại
 
@@ -10,6 +10,7 @@ File `.env` đã được tạo với host **127.0.0.1**, port **3307**, mật k
 cd work-track_be
 source .venv/bin/activate
 python manage.py check
+python manage.py migrate
 python manage.py check_db
 python manage.py runserver 127.0.0.1:8000
 ```
@@ -21,6 +22,16 @@ python manage.py runserver 127.0.0.1:8000
 - DB_NAME mặc định `worktrack`, DB_USER mặc định `root`: đổi nếu bạn đã tạo database/tài khoản khác.
 - CORS cho localhost/127.0.0.1 cổng 3000 và 5173, phù hợp FE đang có hoặc Vite.
 - DEMO_MODE=true cho phép API mô phỏng, không kiểm tra vai trò. Tắt flag sẽ khóa endpoint; API thiết bị thật chưa triển khai.
+
+## Quản lý schema bằng migration
+
+1. Tạo **database MySQL trống** trước và cấu hình `.env` (Django không tạo database). Với database hiện tại đã có đủ 10 bảng mới nhất, migration kiểm tra cấu trúc trước khi ghi nhận; không xóa hoặc tạo lại dữ liệu.
+2. Chạy `python manage.py migrate`; kiểm tra bằng `python manage.py showmigrations attendance` và `python manage.py check_db`. Django tạo thêm bảng kỹ thuật `django_migrations` để lưu lịch sử, ngoài 10 bảng nghiệp vụ.
+3. Migration đầu đóng băng DDL tại `attendance/migrations/schema/0001_initial.sql` cùng manifest kiểm tra cột, khóa ngoại, index và CHECK. Database không đầy đủ hoặc khác baseline sẽ dừng và thông báo; không tự `--fake` hay sửa schema không nhận diện được. Database 10 bảng cũ chưa có bốn nâng cấp QR/HR/support cần nâng cấp và đối chiếu trước khi tiếp nhận baseline.
+4. MySQL DDL tự commit. Nếu tạo database mới bị lỗi giữa chừng, có thể còn một phần bảng: không xóa hoặc chạy lại mù, hãy đọc lỗi và kiểm tra database trước.
+5. **Giới hạn hiện tại:** model còn `managed=False`, vì schema chứa cột generated và CHECK đặc thù. `makemigrations` không tự tạo ALTER TABLE từ thay đổi model unmanaged. Khi bổ sung cột/ràng buộc, developer cần tạo migration Django có `RunSQL`/`RunPython` phù hợp, rồi chạy `python manage.py migrate`; không chạy SQL thủ công trên từng database. Không sửa file `0001` hay file SQL/manifest đã đóng băng sau khi đã triển khai.
+
+Migration chỉ tạo cấu trúc, không tự tạo dữ liệu mẫu. Nếu cần bộ demo, import seed theo [hướng dẫn dữ liệu mẫu](../database/SEED-DATA.md) một lần trên 10 bảng nghiệp vụ còn trống; seed là bước riêng.
 
 ## Cài lại ở môi trường khác
 
@@ -139,7 +150,7 @@ GPS thật và xác thực thực địa; tích hợp camera/máy; quản lý ca
 
 ## Kiểm thử MySQL
 
-Tests import SQL thật và INSERT của seed vào database test riêng, không đổi model sang managed hay dùng SQLite thay MySQL. Có guard yêu cầu bật rõ chế độ test:
+Tests chạy migration để tạo schema thật và import INSERT của seed vào database test riêng; không đổi model sang managed hay dùng SQLite thay MySQL. Có guard yêu cầu bật rõ chế độ test:
 
 ```bash
 # Chọn instance MySQL dành cho test. Account cần quyền tạo/xóa database test.
@@ -149,7 +160,7 @@ export WORKTRACK_TEST_DB_NAME=test_worktrack_backend
 python manage.py test attendance --settings=config.test_settings --noinput
 ```
 
-Không dùng `--keepdb`: test runner tạo schema mới cho unmanaged models. Chỉ dùng tên bắt đầu `test_worktrack_`; Django tạo/xóa database này. 
+Không dùng `--keepdb`: test runner tạo schema bằng migration trong database test riêng. Chỉ dùng tên bắt đầu `test_worktrack_`; Django tạo/xóa database này. 
 
 Các case: đọc đúng bộ 100 người/5 cơ sở không cần token; endpoint login đã bỏ; quét không cần tài khoản; IN/OUT/cooldown/replay/conflict; thiếu phân công/thiếu OUT; áp giải trình đã duyệt; lỗi nhận diện/giờ lùi; không sửa snapshot khóa; JSON sai định dạng; lượt chưa nhận diện; hai lượt đầu đồng thời chỉ một ACCEPTED.
 
