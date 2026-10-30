@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 from django.db import IntegrityError, OperationalError, transaction
 from django.db.models import Q
 from django.utils import timezone
+from django.utils.crypto import salted_hmac
 from rest_framework.exceptions import NotFound, ValidationError
 from .exceptions import Conflict
 from .models import (Employee, Facility, AttendanceScan, WorkSchedule,
@@ -52,22 +53,34 @@ def replay(existing, digest):
     return existing, True
 
 
-def issue_qr(facility_id, previous_token=None):
+def issue_qr(facility_id, previous_token=None, revoke_existing=False, rotation_id=None):
     """Issue a local-demo challenge. Only its hash is stored in MySQL."""
-    try:
-        facility = Facility.objects.get(pk=facility_id, is_active=True)
-    except Facility.DoesNotExist:
-        raise NotFound('Không tìm thấy cơ sở đang hoạt động.')
-    token = secrets.token_urlsafe(32)
-    now = timezone.now()
+    token = (salted_hmac('attendance.qr.rotation', f'{facility_id}:{rotation_id}', algorithm='sha256').hexdigest()
+             if revoke_existing else secrets.token_urlsafe(32))
     with transaction.atomic():
-        if previous_token:
+        try:
+            facility = Facility.objects.select_for_update().get(pk=facility_id, is_active=True)
+        except Facility.DoesNotExist:
+            raise NotFound('Không tìm thấy cơ sở đang hoạt động.')
+        now = timezone.now()
+        if revoke_existing:
+            existing = QrChallenge.objects.filter(facility=facility,
+                policy_snapshot__rotation_id=str(rotation_id)).first()
+            if existing:
+                if existing.revoked_at or existing.expires_at <= now:
+                    raise Conflict('Mã QR của lần đổi này đã hết hạn hoặc bị thu hồi. Hãy đổi mã mới.')
+                return {'token': token, 'facility_id': facility.id, 'issued_at': existing.issued_at,
+                    'expires_at': existing.expires_at, 'server_now': now}
+            QrChallenge.objects.filter(facility=facility, revoked_at__isnull=True,
+                expires_at__gt=now).update(revoked_at=now)
+        elif previous_token:
             previous_hash = hashlib.sha256(previous_token.encode('utf-8')).digest()
             QrChallenge.objects.filter(facility=facility, nonce_hash=previous_hash,
                 revoked_at__isnull=True).update(revoked_at=now)
         qr = QrChallenge.objects.create(facility=facility, nonce_hash=hashlib.sha256(token.encode('utf-8')).digest(),
             issued_at=now, expires_at=now + timedelta(seconds=facility.qr_ttl_seconds),
-            policy_snapshot={'ttl_seconds': facility.qr_ttl_seconds, 'facility_policy_revision': facility.policy_revision, 'mode': 'DEMO'})
+            policy_snapshot={'ttl_seconds': facility.qr_ttl_seconds, 'facility_policy_revision': facility.policy_revision,
+                'mode': 'DEMO', **({'rotation_id': str(rotation_id)} if revoke_existing else {})})
     return {'token': token, 'facility_id': facility.id, 'issued_at': qr.issued_at,
             'expires_at': qr.expires_at, 'server_now': timezone.now()}
 
@@ -321,8 +334,9 @@ def review_request(request_id, decision, review_note, expected_version):
                 raise Conflict('Bằng chứng hiện diện không hợp lệ hoặc không thuộc nhân viên.')
             if origin.facility_id != item.proposed_facility_id:
                 raise Conflict('Cơ sở đề xuất không khớp bằng chứng hiện diện.')
-        if item.request_type == 'ADD_EVENT':
-            events = effective_events(item.employee_id, schedule.work_date)
+        if item.request_type in ('ADD_EVENT', 'PRESENCE'):
+            day = schedule.work_date if schedule else item.proposed_occurred_at.astimezone(BUSINESS_TZ).date()
+            events = effective_events(item.employee_id, day)
             def conflicts(sequence):
                 count = int(bool(sequence) and sequence[0]['type'] != 'IN')
                 for previous, current in zip(sequence, sequence[1:]):
