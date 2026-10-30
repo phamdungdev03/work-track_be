@@ -92,6 +92,13 @@ class DemoScanSerializer(serializers.Serializer):
 class QrIssueSerializer(serializers.Serializer):
     facility_id = serializers.IntegerField(min_value=1)
     previous_token = serializers.CharField(max_length=128, required=False, allow_blank=False)
+    revoke_existing = serializers.BooleanField(required=False, default=False)
+    rotation_id = serializers.UUIDField(required=False)
+
+    def validate(self, attrs):
+        if attrs['revoke_existing'] and not attrs.get('rotation_id'):
+            raise serializers.ValidationError({'rotation_id': 'Cần mã thao tác để đổi QR.'})
+        return attrs
 
 
 class QrScanSerializer(serializers.Serializer):

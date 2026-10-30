@@ -219,6 +219,41 @@ class QrApiTests(TestCase):
         self.issue(previous=token)
         self.assertEqual(self.scan_qr(token, key='revoked').data['scan']['reason_code'], 'QR_REVOKED')
 
+    def test_manual_rotation_revokes_all_active_codes_only_at_selected_facility(self):
+        first = self.issue()
+        other_tab = self.issue()
+        other_facility = self.issue(facility=3)
+        payload = {'facility_id': 2, 'revoke_existing': True, 'rotation_id': 'c1d0fe5d-6bfd-48c4-a53b-5c56b4d46213'}
+        response = self.client.post('/api/qr/challenges/', payload, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        replay = self.client.post('/api/qr/challenges/', payload, format='json')
+        self.assertEqual(replay.data['token'], response.data['token'])
+        for key, token in [('first', first), ('other-tab', other_tab)]:
+            self.assertEqual(self.scan_qr(token, key=key).data['scan']['reason_code'], 'QR_REVOKED')
+        self.assertEqual(self.scan_qr(other_facility, key='other-facility', facility=3).data['scan']['outcome'], 'ACCEPTED')
+        self.assertEqual(self.scan_qr(response.data['token'], key='new', employee=2).data['scan']['outcome'], 'ACCEPTED')
+        another = self.client.post('/api/qr/challenges/', {**payload, 'rotation_id': '77c935a2-9cb9-410e-8e6a-4fd61f36c332'}, format='json')
+        self.assertEqual(another.status_code, 201, another.data)
+        self.assertEqual(self.client.post('/api/qr/challenges/', payload, format='json').status_code, 409)
+        self.assertEqual(self.scan_qr(another.data['token'], key='latest', employee=3).data['scan']['outcome'], 'ACCEPTED')
+
+    def test_approving_presence_after_successful_scan_rejects_duplicate_event(self):
+        token = self.issue()
+        pending = self.scan_qr(token, gps='UNAVAILABLE')
+        item = AttendanceRequest.objects.get(origin_scan_id=pending.data['scan']['id'])
+        accepted = self.scan_qr(token, key='valid-after-pending')
+        self.assertEqual(accepted.data['scan']['event_type'], 'IN')
+        result = self.client.post(f'/api/requests/{item.id}/review/', {
+            'decision': 'APPROVED', 'review_note': 'Đã xác minh', 'expected_version': item.version,
+        }, format='json')
+        self.assertEqual(result.status_code, 409, result.data)
+        item.refresh_from_db()
+        self.assertEqual(item.status, 'PENDING')
+        rejected = self.client.post(f'/api/requests/{item.id}/review/', {
+            'decision': 'REJECTED', 'review_note': 'Đã chấm lại thành công', 'expected_version': item.version,
+        }, format='json')
+        self.assertEqual(rejected.status_code, 200, rejected.data)
+
     def test_missing_gps_or_qr_pending_without_consuming(self):
         token = self.issue()
         pending = self.scan_qr(token, gps='UNAVAILABLE')
