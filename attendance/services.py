@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from django.db import IntegrityError, OperationalError, transaction
 from django.db.models import Q
 from django.utils import timezone
-from rest_framework.exceptions import NotFound
+from rest_framework.exceptions import NotFound, ValidationError
 from .exceptions import Conflict
 from .models import (Employee, Facility, AttendanceScan, WorkSchedule,
                      AttendanceRequest, SupportAssignment, AttendanceAlert, AuditLog, QrChallenge)
@@ -90,6 +90,50 @@ def record_demo_scan(data, channel='FACE'):
 
 
 @transaction.atomic
+def create_add_event_request(data):
+    employee = Employee.objects.select_for_update().filter(pk=data['employee_id']).first()
+    if not employee:
+        raise NotFound('Không tìm thấy nhân viên.')
+    existing = AttendanceRequest.objects.filter(client_request_id=data['request_id']).first()
+    if existing:
+        same = (existing.employee_id == employee.id and existing.schedule and existing.schedule.work_date == data['date']
+                and existing.proposed_facility_id == data['facility_id'] and existing.proposed_event_type == data['event_type']
+                and existing.proposed_occurred_at == data['occurred_at'] and existing.reason == data['reason']
+                and existing.target_scan_id == data.get('target_scan_id'))
+        if not same:
+            raise Conflict('Mã yêu cầu đã được dùng với nội dung khác.')
+        return existing, True
+    schedule = WorkSchedule.objects.select_for_update().filter(employee=employee, work_date=data['date'], status='SCHEDULED').first()
+    if not schedule:
+        raise ValidationError('Nhân viên chưa có ca làm việc trong ngày.')
+    if schedule.locked_at:
+        raise Conflict('Ngày công đã khóa. Cần mở lại trước khi giải trình.')
+    if data['occurred_at'].astimezone(BUSINESS_TZ).date() != data['date']:
+        raise ValidationError('Giờ đề xuất phải thuộc ngày làm việc.')
+    if not Facility.objects.filter(pk=data['facility_id'], is_active=True).exists():
+        raise ValidationError('Cơ sở không tồn tại hoặc đã ngừng hoạt động.')
+    target = None
+    if data.get('target_scan_id'):
+        target = AttendanceScan.objects.filter(pk=data['target_scan_id'], employee=employee, outcome='ACCEPTED').first()
+        if not target or target.occurred_at.astimezone(BUSINESS_TZ).date() != data['date']:
+            raise ValidationError('Lượt cần sửa không hợp lệ hoặc không thuộc nhân viên và ngày đã chọn.')
+        if AttendanceRequest.objects.filter(target_scan=target, status='APPROVED').exists():
+            raise Conflict('Lượt này đã có điều chỉnh được duyệt.')
+        if AttendanceRequest.objects.filter(target_scan=target, status='PENDING').exists():
+            raise Conflict('Lượt này đã có yêu cầu đang chờ duyệt.')
+    request_type = 'REPLACE_EVENT' if target else 'ADD_EVENT'
+    if AttendanceRequest.objects.filter(employee=employee, schedule=schedule, request_type=request_type, status='PENDING',
+            proposed_event_type=data['event_type'], proposed_occurred_at=data['occurred_at'], proposed_facility_id=data['facility_id']).exists():
+        raise Conflict('Đã có yêu cầu bổ sung lượt này đang chờ duyệt.')
+    item = AttendanceRequest.objects.create(client_request_id=data['request_id'], employee=employee, schedule=schedule,
+        request_type=request_type, target_scan=target, proposed_event_type=data['event_type'], proposed_occurred_at=data['occurred_at'],
+        proposed_facility_id=data['facility_id'], reason=data['reason'], status='PENDING')
+    AuditLog.objects.create(actor_type='SYSTEM', action='CREATE_ATTENDANCE_REQUEST', entity_type='attendance_requests',
+        entity_id=item.id, after_data={'mode': 'DEMO', 'request_type': request_type}, reason=data['reason'])
+    return item, False
+
+
+@transaction.atomic
 def _record(data, source_key, digest, channel):
     # A stable employee row also serializes concurrent FIRST scans with no history.
     try:
@@ -106,6 +150,12 @@ def _record(data, source_key, digest, channel):
     received_at = timezone.now()
     occurred_at = data.get('occurred_at', received_at)
     day = occurred_at.astimezone(BUSINESS_TZ).date()
+    if (day >= received_at.astimezone(BUSINESS_TZ).date() and employee.status == 'ACTIVE'
+            and employee.hired_on <= day and (not employee.ended_on or day <= employee.ended_on)
+            and employee.home_facility.is_active
+            and not WorkSchedule.objects.filter(employee=employee, work_date=day).exists()):
+        from .support_services import create_demo_schedule
+        create_demo_schedule(employee.id, day, automatic=True)
     schedule = WorkSchedule.objects.filter(employee=employee, work_date=day, status='SCHEDULED').first()
     previous = AttendanceScan.objects.filter(employee=employee, outcome='ACCEPTED').order_by('-occurred_at', '-id').first()
     events = effective_events(employee.id, day)
@@ -158,9 +208,10 @@ def _record(data, source_key, digest, channel):
     alert = None
     if outcome == 'ACCEPTED':
         home_id = schedule.owner_facility_id if schedule else employee.home_facility_id
+        # Assignment is checked by employee, work date and destination; arriving
+        # earlier or leaving later than its planned window is still supported work.
         assigned = schedule and SupportAssignment.objects.filter(schedule=schedule, to_facility=facility,
-                        status__in=['PLANNED', 'CONFIRMED'], depart_at__lte=occurred_at,
-                        support_ends_at__gte=occurred_at).exists()
+                        status__in=['PLANNED', 'CONFIRMED']).exists()
         if facility.id != home_id and not assigned:
             warnings.append('SUPPORT_UNASSIGNED')
             alert, created = AttendanceAlert.objects.get_or_create(employee=employee, facility=facility,
@@ -270,6 +321,21 @@ def review_request(request_id, decision, review_note, expected_version):
                 raise Conflict('Bằng chứng hiện diện không hợp lệ hoặc không thuộc nhân viên.')
             if origin.facility_id != item.proposed_facility_id:
                 raise Conflict('Cơ sở đề xuất không khớp bằng chứng hiện diện.')
+        if item.request_type == 'ADD_EVENT':
+            events = effective_events(item.employee_id, schedule.work_date)
+            def conflicts(sequence):
+                count = int(bool(sequence) and sequence[0]['type'] != 'IN')
+                for previous, current in zip(sequence, sequence[1:]):
+                    count += int(previous['type'] == current['type'])
+                    count += int(previous['type'] == 'IN' and current['type'] == 'OUT' and previous['facility_id'] != current['facility_id'])
+                return count
+            before_conflicts = conflicts(events)
+            events.append({'time': item.proposed_occurred_at, 'type': item.proposed_event_type,
+                           'facility_id': item.proposed_facility_id, 'ref': f'request:{item.id}'})
+            events.sort(key=lambda event: (event['time'], event['ref']))
+            after_conflicts = conflicts(events)
+            if after_conflicts > before_conflicts or (before_conflicts and after_conflicts >= before_conflicts):
+                raise Conflict('Lượt đề xuất không xử lý được bất thường vào/ra. Hãy kiểm tra lịch sử trước khi duyệt.')
         if schedule and item.proposed_occurred_at and item.proposed_occurred_at.astimezone(BUSINESS_TZ).date() != schedule.work_date:
             raise Conflict('Thời gian đề xuất không thuộc ngày của lịch ca.')
     before = {'status': item.status, 'version': item.version}

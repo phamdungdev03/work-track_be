@@ -1,6 +1,6 @@
 # WorkTrack Backend — demo chấm công, không đăng nhập
 
-Dùng source `work-track_be` với MySQL. Django migration `attendance.0001_initial` tạo cấu trúc 10 bảng trong database trống hoặc kiểm tra rồi ghi nhận schema hiện có. Không import lại schema/seed khi khởi động. Models hiện vẫn `managed=False`; các ràng buộc MySQL và cột generated được giữ trong baseline SQL đóng băng của migration. SQLite không được hỗ trợ.
+Dùng source `work-track_be` với MySQL. Django migration `attendance.0001_initial` tạo cấu trúc 10 bảng trong database trống hoặc kiểm tra rồi ghi nhận schema hiện có; `0002_demo_add_event_requests` và `0003_demo_replace_event_requests` thêm mã chống gửi trùng và điều chỉnh ràng buộc giải trình demo. Không import lại schema/seed khi khởi động. Models hiện vẫn `managed=False`; SQLite không được hỗ trợ.
 
 ## Khởi động trên máy hiện tại
 
@@ -64,6 +64,7 @@ Bảng users và các FK người tạo/người duyệt trong dữ liệu SQL v
 | GET | /api/employees/ | Nhân viên |
 | GET | /api/employees/{id}/ | Chi tiết nhân viên |
 | GET | /api/schedules/ | Lịch ca |
+| POST | /api/schedules/defaults/ | Tự tạo ca demo mặc định cho nhân viên đủ điều kiện vào ngày hiện tại/tương lai |
 | POST | /api/schedules/demo-create/ | Tạo ca demo khi chưa có ca |
 | GET | /api/support-assignments/ | Phân công support |
 | POST | /api/support-assignments/create/ | Tạo phân công, có request_id chống trùng |
@@ -76,7 +77,10 @@ Bảng users và các FK người tạo/người duyệt trong dữ liệu SQL v
 | GET | /api/alerts/ | Cảnh báo HR |
 | POST | /api/alerts/{id}/verify/ | Xác minh support, yêu cầu ghi chú |
 | GET | /api/requests/ | Giải trình |
+| POST | /api/requests/add-event/ | Tạo giải trình bổ sung lượt; kèm target_scan_id để đề nghị sửa lượt gốc |
 | POST | /api/requests/{id}/review/ | Duyệt hoặc từ chối yêu cầu, yêu cầu ghi chú |
+| GET | /api/work-days/?date=YYYY-MM-DD | Công ngày và lý do cần xác minh |
+| GET | /api/work-months/?month=YYYY-MM | Số lần đi muộn/về sớm trong tháng |
 
 List phân trang: `count`, `next`, `previous`, `results`; `page=1&page_size=20` (tối đa 100).
 

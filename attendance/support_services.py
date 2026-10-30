@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone as utc
 
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.utils import timezone
 from rest_framework.exceptions import NotFound, ValidationError
 
@@ -20,7 +21,7 @@ def creation_hash(data):
 def snapshot(item):
     return {'schedule_id': item.schedule_id, 'from_facility_id': item.from_facility_id,
             'to_facility_id': item.to_facility_id, 'depart_at': item.depart_at.isoformat(),
-            'expected_arrival_at': item.expected_arrival_at.isoformat(),
+            'expected_arrival_at': item.expected_arrival_at.isoformat() if item.expected_arrival_at else None,
             'support_ends_at': item.support_ends_at.isoformat(), 'status': item.status,
             'reason': item.reason, 'confirmed_by': item.confirmed_by_id,
             'confirmed_at': item.confirmed_at.isoformat() if item.confirmed_at else None, 'mode': 'HR_DEMO'}
@@ -49,8 +50,8 @@ def validate_fields(schedule, data, *, exclude_id=None):
         facility = facilities.get(data[field])
         if facility is None or not facility.is_active:
             raise ValidationError({field: 'Cơ sở không tồn tại hoặc đã ngừng hoạt động.'})
-    if not schedule.starts_at <= data['depart_at'] <= data['expected_arrival_at'] < data['support_ends_at'] <= schedule.ends_at:
-        raise ValidationError({'depart_at': 'Giờ đi, đến và kết thúc phải thuộc ca; giờ đến phải trước giờ kết thúc.'})
+    if not schedule.starts_at <= data['depart_at'] < data['support_ends_at'] <= schedule.ends_at:
+        raise ValidationError({'depart_at': 'Giờ bắt đầu và kết thúc support phải thuộc ca; giờ bắt đầu phải trước giờ kết thúc.'})
     overlaps = SupportAssignment.objects.filter(schedule=schedule, status__in=['PLANNED', 'CONFIRMED'],
         depart_at__lt=data['support_ends_at'], support_ends_at__gt=data['depart_at'])
     if exclude_id:
@@ -77,7 +78,7 @@ def create_assignment(data):
             validate_fields(schedule, data)
             item = SupportAssignment.objects.create(schedule=schedule, from_facility_id=data['from_facility_id'],
                 to_facility_id=data['to_facility_id'], depart_at=data['depart_at'],
-                expected_arrival_at=data['expected_arrival_at'], support_ends_at=data['support_ends_at'],
+                expected_arrival_at=data.get('expected_arrival_at'), support_ends_at=data['support_ends_at'],
                 reason=data['reason'], status='CONFIRMED', created_by=None, confirmed_by=None,
                 confirmed_at=timezone.now(), client_request_id=data['request_id'], creation_hash=digest)
             AuditLog.objects.create(actor_type='SYSTEM', action='CREATE_SUPPORT_ASSIGNMENT',
@@ -116,9 +117,12 @@ def update_assignment(assignment_id, data):
     check_version(item, data['expected_updated_at'])
     validate_fields(schedule, data, exclude_id=item.id)
     before = snapshot(item)
-    for field in ('from_facility_id', 'to_facility_id', 'depart_at', 'expected_arrival_at', 'support_ends_at', 'reason'):
+    for field in ('from_facility_id', 'to_facility_id', 'depart_at', 'support_ends_at', 'reason'):
         setattr(item, field, data[field])
-    fields = ['from_facility', 'to_facility', 'depart_at', 'expected_arrival_at', 'support_ends_at', 'reason', 'updated_at']
+    fields = ['from_facility', 'to_facility', 'depart_at', 'support_ends_at', 'reason', 'updated_at']
+    if 'expected_arrival_at' in data:
+        item.expected_arrival_at = data['expected_arrival_at']
+        fields.append('expected_arrival_at')
     if item.status == 'CONFIRMED':
         item.confirmed_by = None
         item.confirmed_at = timezone.now()
@@ -142,7 +146,7 @@ def cancel_assignment(assignment_id, data):
 
 
 @transaction.atomic
-def create_demo_schedule(employee_id, work_date):
+def create_demo_schedule(employee_id, work_date, *, automatic=False):
     """Explicit opt-in: one default shift per employee/day, serialized by employee."""
     from datetime import time
     from zoneinfo import ZoneInfo
@@ -171,5 +175,40 @@ def create_demo_schedule(employee_id, work_date):
     AuditLog.objects.create(actor_type='SYSTEM', action='CREATE_DEMO_SCHEDULE', entity_type='work_schedules',
         entity_id=item.id, after_data={'employee_id':employee_id,'work_date':work_date.isoformat(),
             'starts_at':item.starts_at.isoformat(),'ends_at':item.ends_at.isoformat(),
-            'policy_snapshot':item.policy_snapshot,'mode':'HR_DEMO'}, reason='Tạo ca demo theo thao tác HR')
+            'policy_snapshot':item.policy_snapshot,'mode':'AUTO_DEMO' if automatic else 'HR_DEMO'},
+        reason='Tạo ca mặc định khi chấm công' if automatic else 'Tạo ca demo theo thao tác HR')
     return item, False
+
+
+@transaction.atomic
+def ensure_default_schedules(work_date):
+    """Create today's or a future demo day's missing schedules, never alter existing ones."""
+    from datetime import time
+    from zoneinfo import ZoneInfo
+    zone = ZoneInfo('Asia/Ho_Chi_Minh')
+    if work_date < timezone.now().astimezone(zone).date():
+        raise ValidationError({'work_date': 'Không tự tạo ca cho ngày đã qua.'})
+    employees = list(Employee.objects.filter(status='ACTIVE', hired_on__lte=work_date,
+        home_facility__is_active=True).filter(Q(ended_on__isnull=True) | Q(ended_on__gte=work_date))
+        .order_by('id').select_for_update())
+    existing = set(WorkSchedule.objects.filter(work_date=work_date,
+        employee_id__in=[employee.id for employee in employees]).values_list('employee_id', flat=True))
+    starts_at = datetime.combine(work_date, time(8, 30), tzinfo=zone)
+    ends_at = datetime.combine(work_date, time(17, 30), tzinfo=zone)
+    policy = {'version': 'demo-v1', 'break_start_local': '12:00', 'break_end_local': '13:00',
+              'break_confirmed': False, 'rounding': 'floor_minutes', 'automatic_ot': False,
+              'max_regular_minutes': 480}
+    schedules = [WorkSchedule(employee=employee, owner_facility_id=employee.home_facility_id,
+        work_date=work_date, timezone='Asia/Ho_Chi_Minh', starts_at=starts_at, ends_at=ends_at,
+        standard_work_minutes=480, unpaid_break_minutes=60, status='SCHEDULED', revision=1,
+        policy_snapshot=policy, created_by=None) for employee in employees if employee.id not in existing]
+    WorkSchedule.objects.bulk_create(schedules)
+    created_ids = dict(WorkSchedule.objects.filter(work_date=work_date,
+        employee_id__in=[item.employee_id for item in schedules]).values_list('employee_id', 'id'))
+    AuditLog.objects.bulk_create([AuditLog(actor_type='SYSTEM', action='CREATE_DEMO_SCHEDULE',
+        entity_type='work_schedules', entity_id=created_ids[item.employee_id],
+        after_data={'employee_id': item.employee_id, 'work_date': work_date.isoformat(),
+                    'starts_at': starts_at.isoformat(), 'ends_at': ends_at.isoformat(),
+                    'policy_snapshot': policy, 'mode': 'AUTO_DEMO'},
+        reason='Tạo ca mặc định cho ngày demo') for item in schedules])
+    return {'work_date': work_date, 'created': len(schedules), 'existing': len(existing)}

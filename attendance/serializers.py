@@ -122,19 +122,33 @@ class ReviewRequestSerializer(serializers.Serializer):
     expected_version = serializers.IntegerField(min_value=1)
 
 
+class AddEventRequestSerializer(serializers.Serializer):
+    request_id = serializers.RegexField(r'^[A-Za-z0-9_.:-]+$', max_length=100)
+    employee_id = serializers.IntegerField(min_value=1)
+    date = serializers.DateField()
+    facility_id = serializers.IntegerField(min_value=1)
+    event_type = serializers.ChoiceField(choices=['IN', 'OUT'])
+    occurred_at = OffsetDateTimeField()
+    reason = serializers.CharField(max_length=1000, trim_whitespace=True)
+    target_scan_id = serializers.IntegerField(min_value=1, required=False)
+
+
 class SupportFieldsSerializer(serializers.Serializer):
     from_facility_id = serializers.IntegerField(min_value=1)
     to_facility_id = serializers.IntegerField(min_value=1)
     depart_at = OffsetDateTimeField()
-    expected_arrival_at = OffsetDateTimeField()
+    expected_arrival_at = OffsetDateTimeField(required=False, allow_null=True)
     support_ends_at = OffsetDateTimeField()
     reason = serializers.CharField(max_length=1000, trim_whitespace=True)
 
     def validate(self, data):
         if data['from_facility_id'] == data['to_facility_id']:
             raise serializers.ValidationError({'to_facility_id': 'Cơ sở đến phải khác cơ sở đi.'})
-        if not data['depart_at'] <= data['expected_arrival_at'] < data['support_ends_at']:
-            raise serializers.ValidationError({'expected_arrival_at': 'Giờ đi phải trước hoặc bằng giờ đến; giờ đến phải trước giờ kết thúc.'})
+        if not data['depart_at'] < data['support_ends_at']:
+            raise serializers.ValidationError({'support_ends_at': 'Giờ kết thúc phải sau giờ bắt đầu support.'})
+        arrival = data.get('expected_arrival_at')
+        if arrival is not None and not data['depart_at'] <= arrival < data['support_ends_at']:
+            raise serializers.ValidationError({'expected_arrival_at': 'Giờ đến dự kiến phải nằm trong khoảng support.'})
         return data
 
     def to_internal_value(self, data):
@@ -162,4 +176,8 @@ class SupportCancelSerializer(serializers.Serializer):
 
 class DemoScheduleCreateSerializer(serializers.Serializer):
     employee_id = serializers.IntegerField(min_value=1)
+    work_date = serializers.DateField()
+
+
+class DefaultSchedulesSerializer(serializers.Serializer):
     work_date = serializers.DateField()
