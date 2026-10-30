@@ -1,8 +1,10 @@
 from django.conf import settings
-from django.db import connection, DatabaseError
+from datetime import date, timedelta
+from django.db import connection, DatabaseError, IntegrityError
 from django.db.models import Q
+from django.utils import timezone
 from rest_framework import generics
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -11,9 +13,12 @@ from .models import (Employee, Facility, WorkSchedule, SupportAssignment,
 from .serializers import (EmployeeSerializer, FacilitySerializer,
     ScheduleSerializer, SupportSerializer, ScanSerializer, AlertSerializer,
     RequestSerializer, QuerySerializer, DemoScanSerializer, QrIssueSerializer, QrScanSerializer,
-    VerifyAlertSerializer, ReviewRequestSerializer, SupportCreateSerializer, SupportUpdateSerializer, SupportCancelSerializer, DemoScheduleCreateSerializer)
-from .services import day_bounds, record_demo_scan, issue_qr, verify_alert, review_request
-from .support_services import create_assignment, update_assignment, cancel_assignment, create_demo_schedule
+    VerifyAlertSerializer, ReviewRequestSerializer, SupportCreateSerializer, SupportUpdateSerializer, SupportCancelSerializer, DemoScheduleCreateSerializer, AddEventRequestSerializer, OffsetDateTimeField)
+from .services import day_bounds, record_demo_scan, issue_qr, verify_alert, review_request, create_add_event_request
+from .daily_services import daily_rows
+from .exceptions import Conflict
+from .support_services import create_assignment, update_assignment, cancel_assignment, create_demo_schedule, ensure_default_schedules
+from .serializers import DefaultSchedulesSerializer
 
 
 class HealthView(APIView):
@@ -133,6 +138,53 @@ class RequestList(FilteredList):
     date_path = 'schedule__work_date'
 
 
+class WorkDayView(APIView):
+    def get(self, request):
+        try:
+            day = date.fromisoformat(request.query_params.get('date', ''))
+        except ValueError:
+            raise ValidationError('Vui lòng chọn ngày hợp lệ.')
+        as_of = request.query_params.get('as_of')
+        now = OffsetDateTimeField().run_validation(as_of) if as_of else None
+        return Response(daily_rows(day, day, now))
+
+
+class WorkMonthView(APIView):
+    def get(self, request):
+        try:
+            month = request.query_params.get('month', '')
+            start = date.fromisoformat(month + '-01')
+            if len(month) != 7:
+                raise ValueError()
+            end = (start.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+        except ValueError:
+            raise ValidationError('Vui lòng chọn tháng hợp lệ.')
+        as_of = request.query_params.get('as_of')
+        now = OffsetDateTimeField().run_validation(as_of) if as_of else timezone.now()
+        summary = {}
+        for row in daily_rows(start, end, now):
+            item = summary.setdefault(row['employee_id'], {'employee_id': row['employee_id'], 'late_count': 0, 'early_count': 0, 'incomplete_count': 0})
+            if row['work_minutes'] is None and row['schedule_end'] and row['schedule_end'] <= now:
+                item['incomplete_count'] += 1
+            elif row['work_minutes'] is not None:
+                item['late_count'] += int(row['late_minutes'] > 0)
+                item['early_count'] += int(row['early_minutes'] > 0)
+        return Response(list(summary.values()))
+
+
+class AddEventRequestView(APIView):
+    def post(self, request):
+        if not settings.DEMO_MODE:
+            raise PermissionDenied('Bật DEMO_MODE để tạo giải trình mô phỏng.')
+        serializer = AddEventRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            item, replayed = create_add_event_request(serializer.validated_data)
+        except IntegrityError:
+            raise Conflict('Yêu cầu trùng hoặc dữ liệu đã thay đổi, hãy thử lại.')
+        return Response({'request': RequestSerializer(item).data, 'replayed': replayed}, status=200 if replayed else 201)
+
+
 class DemoScanView(APIView):
     def post(self, request):
         if not settings.DEMO_MODE:
@@ -224,3 +276,12 @@ class DemoScheduleCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         item, replayed = create_demo_schedule(**serializer.validated_data)
         return Response({'schedule': ScheduleSerializer(item).data, 'replayed': replayed}, status=200 if replayed else 201)
+
+
+class DefaultSchedulesView(APIView):
+    def post(self, request):
+        if not settings.DEMO_MODE:
+            raise PermissionDenied('Bật DEMO_MODE để tạo ca mặc định.')
+        serializer = DefaultSchedulesSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(ensure_default_schedules(**serializer.validated_data))

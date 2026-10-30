@@ -83,7 +83,7 @@ class WorkSchedule(models.Model):
 class SupportAssignment(models.Model):
     id = models.BigAutoField(primary_key=True)
     depart_at = models.DateTimeField()
-    expected_arrival_at = models.DateTimeField()
+    expected_arrival_at = models.DateTimeField(null=True)
     support_ends_at = models.DateTimeField()
     status = models.CharField(max_length=30, default='PLANNED')
     reason = models.CharField(max_length=1000)
@@ -170,6 +170,7 @@ class AttendanceScan(models.Model):
 
 class AttendanceRequest(models.Model):
     id = models.BigAutoField(primary_key=True)
+    client_request_id = models.CharField(max_length=100, null=True)
     employee = models.ForeignKey('Employee', on_delete=models.DO_NOTHING, db_column='employee_id', related_name='+')
     schedule = models.ForeignKey('WorkSchedule', on_delete=models.DO_NOTHING, db_column='schedule_id', related_name='+', null=True)
     requested_by = models.ForeignKey('Account', on_delete=models.DO_NOTHING, db_column='requested_by', related_name='+', null=True)

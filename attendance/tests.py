@@ -11,7 +11,7 @@ from django.db import connection, close_old_connections
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
-from .models import WorkSchedule, Employee, AttendanceScan, AttendanceRequest, AttendanceAlert, AuditLog, QrChallenge
+from .models import WorkSchedule, Employee, AttendanceScan, AttendanceRequest, AttendanceAlert, AuditLog, QrChallenge, SupportAssignment
 from .serializers import DemoScanSerializer, QrScanSerializer
 from .services import effective_events, record_demo_scan, issue_qr, review_request
 from .exceptions import Conflict
@@ -385,6 +385,65 @@ class SupportAssignmentTests(TestCase):
         adjacent=self.create(request_id='support-next',depart_at='2026-10-28T10:00:00+07:00',expected_arrival_at='2026-10-28T10:15:00+07:00',support_ends_at='2026-10-28T11:00:00+07:00')
         self.assertEqual(adjacent.status_code,201,adjacent.data)
 
+    def test_support_uses_only_start_end_and_preserves_legacy_arrival(self):
+        payload = {key: value for key, value in self.payload.items() if key != 'expected_arrival_at'}
+        result = self.client.post('/api/support-assignments/create/', payload, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertIsNone(result.data['assignment']['expected_arrival_at'])
+        self.assertEqual(self.client.post('/api/support-assignments/create/', payload, format='json').status_code, 200)
+        invalid = {**payload, 'request_id': 'invalid-window', 'depart_at': payload['support_ends_at']}
+        self.assertEqual(self.client.post('/api/support-assignments/create/', invalid, format='json').status_code, 400)
+
+        old = SupportAssignment.objects.filter(expected_arrival_at__isnull=False, status='CONFIRMED').exclude(schedule_id=201).first()
+        self.assertIsNotNone(old)
+        old_arrival = old.expected_arrival_at
+        edit = {'from_facility_id': old.from_facility_id, 'to_facility_id': old.to_facility_id,
+                'depart_at': old.depart_at.isoformat(), 'support_ends_at': old.support_ends_at.isoformat(),
+                'reason': 'Cập nhật lý do', 'expected_updated_at': old.updated_at.isoformat()}
+        edited = self.client.put(f'/api/support-assignments/{old.id}/', edit, format='json')
+        self.assertEqual(edited.status_code, 200, edited.data)
+        old.refresh_from_db()
+        self.assertEqual(old.expected_arrival_at, old_arrival)
+
+    def test_support_assignment_covers_day_including_early_and_late_scans(self):
+        from zoneinfo import ZoneInfo
+        day = timezone.now().astimezone(ZoneInfo('Asia/Ho_Chi_Minh')).date() + timedelta(days=1)
+        schedule = self.client.post('/api/schedules/demo-create/', {'employee_id': 1, 'work_date': day.isoformat()}, format='json').data['schedule']
+        payload = {'request_id': 'boundary-support', 'schedule_id': schedule['id'], 'from_facility_id': 1,
+                   'to_facility_id': 2, 'depart_at': f'{day}T10:00:00+07:00',
+                   'support_ends_at': f'{day}T11:00:00+07:00', 'reason': 'Hỗ trợ'}
+        response = self.client.post('/api/support-assignments/create/', payload, format='json')
+        self.assertEqual(response.status_code, 201, response.data)
+        for stamp in ('09:59', '10:00', '11:00', '11:01'):
+            scan = self.client.post('/api/scans/demo/', {'request_id': f'boundary-{stamp}', 'employee_id': 1,
+                'facility_id': 2, 'occurred_at': f'{day}T{stamp}:00+07:00'}, format='json')
+            self.assertEqual(scan.status_code, 201, scan.data)
+            self.assertEqual(scan.data['scan']['outcome'], 'ACCEPTED')
+            self.assertNotIn('SUPPORT_UNASSIGNED', scan.data['warnings'])
+        wrong_facility = self.client.post('/api/scans/demo/', {'request_id': 'wrong-support-facility', 'employee_id': 1,
+            'facility_id': 3, 'occurred_at': f'{day}T11:02:00+07:00'}, format='json')
+        self.assertIn('SUPPORT_UNASSIGNED', wrong_facility.data['warnings'])
+        SupportAssignment.objects.filter(pk=response.data['assignment']['id']).update(status='CANCELLED')
+        cancelled = self.client.post('/api/scans/demo/', {'request_id': 'cancelled-support', 'employee_id': 1,
+            'facility_id': 2, 'occurred_at': f'{day}T11:03:00+07:00'}, format='json')
+        self.assertEqual(cancelled.data['scan']['outcome'], 'ACCEPTED')
+        self.assertIn('SUPPORT_UNASSIGNED', cancelled.data['warnings'])
+
+    def test_qr_before_start_is_covered_by_same_day_assignment(self):
+        from zoneinfo import ZoneInfo
+        day = timezone.now().astimezone(ZoneInfo('Asia/Ho_Chi_Minh')).date() + timedelta(days=1)
+        schedule = self.client.post('/api/schedules/demo-create/', {'employee_id': 1, 'work_date': day.isoformat()}, format='json').data['schedule']
+        assignment = {'request_id': 'qr-early-support', 'schedule_id': schedule['id'], 'from_facility_id': 1,
+                      'to_facility_id': 2, 'depart_at': f'{day}T13:00:00+07:00',
+                      'support_ends_at': f'{day}T17:30:00+07:00', 'reason': 'Hỗ trợ'}
+        self.assertEqual(self.client.post('/api/support-assignments/create/', assignment, format='json').status_code, 201)
+        token = issue_qr(2)['token']
+        result = self.client.post('/api/qr/scans/', {'request_id': 'qr-early', 'employee_id': 1, 'facility_id': 2,
+            'occurred_at': f'{day}T12:50:00+07:00', 'gps_status': 'IN_RANGE', 'qr_token': token}, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(result.data['scan']['outcome'], 'ACCEPTED')
+        self.assertNotIn('SUPPORT_UNASSIGNED', result.data['warnings'])
+
     def test_locked_cancelled_and_inactive_cases(self):
         WorkSchedule.objects.filter(pk=201).update(locked_at=timezone.now(),locked_by_id=101,locked_result={'regular_minutes':480})
         self.assertEqual(self.create().status_code,409)
@@ -544,3 +603,158 @@ class ConcurrentScanTests(TransactionTestCase):
         with ThreadPoolExecutor(max_workers=2) as executor:
             outcomes=list(executor.map(submit,[1,2]))
         self.assertCountEqual(outcomes,['ACCEPTED','IGNORED'])
+
+class DailyWorkFlowTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        seed_database()
+    def setUp(self):
+        self.client = APIClient()
+    def test_missing_out_request_approval_updates_daily_and_month(self):
+        schedule = self.client.post('/api/schedules/demo-create/', {'employee_id': 1, 'work_date': '2026-10-29'}, format='json')
+        self.assertIn(schedule.status_code, (200, 201), schedule.data)
+        scan = self.client.post('/api/scans/demo/', {'request_id': 'daily-in', 'employee_id': 1, 'facility_id': 1, 'occurred_at': '2026-10-29T09:00:30+07:00', 'recognition': 'MATCH'}, format='json')
+        self.assertEqual(scan.status_code, 201, scan.data)
+        row = next(r for r in self.client.get('/api/work-days/?date=2026-10-29').data if r['employee_id'] == 1)
+        self.assertIsNone(row['work_minutes'])
+        payload = {'request_id': 'add-out-1', 'employee_id': 1, 'date': '2026-10-29', 'facility_id': 1, 'event_type': 'OUT', 'occurred_at': '2026-10-29T17:00:00+07:00', 'reason': 'Quên quét ra'}
+        result = self.client.post('/api/requests/add-event/', payload, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertEqual(self.client.post('/api/requests/add-event/', payload, format='json').status_code, 200)
+        item = result.data['request']
+        reviewed = self.client.post(f"/api/requests/{item['id']}/review/", {'decision': 'APPROVED', 'review_note': 'Đã xác minh', 'expected_version': item['version']}, format='json')
+        self.assertEqual(reviewed.status_code, 200, reviewed.data)
+        row = next(r for r in self.client.get('/api/work-days/?date=2026-10-29').data if r['employee_id'] == 1)
+        self.assertEqual((row['late_minutes'], row['early_minutes'], row['work_minutes']), (30, 30, 420))
+        self.assertEqual(AttendanceScan.objects.filter(employee_id=1, source_event_id='daily-in').count(), 1)
+        month = next(r for r in self.client.get('/api/work-months/?month=2026-10').data if r['employee_id'] == 1)
+        self.assertGreaterEqual(month['late_count'], 1)
+        self.assertGreaterEqual(month['early_count'], 1)
+    def test_does_not_approve_invalid_sequence(self):
+        self.client.post('/api/schedules/demo-create/', {'employee_id': 1, 'work_date': '2026-10-29'}, format='json')
+        self.client.post('/api/scans/demo/', {'request_id': 'test-in', 'employee_id': 1, 'facility_id': 1, 'occurred_at': '2026-10-29T08:30:00+07:00'}, format='json')
+        payload = {'request_id': 'invalid-in', 'employee_id': 1, 'date': '2026-10-29', 'facility_id': 1, 'event_type': 'IN', 'occurred_at': '2026-10-29T09:00:00+07:00', 'reason': 'Nhập nhầm'}
+        item = self.client.post('/api/requests/add-event/', payload, format='json').data['request']
+        result = self.client.post(f"/api/requests/{item['id']}/review/", {'decision': 'APPROVED', 'review_note': 'Kiểm tra', 'expected_version': item['version']}, format='json')
+        self.assertEqual(result.status_code, 409)
+
+    def test_two_missing_outs_can_be_approved_one_at_a_time(self):
+        self.client.post('/api/schedules/demo-create/', {'employee_id': 1, 'work_date': '2026-10-29'}, format='json')
+        for key, facility, stamp in [('a', 1, '08:30'), ('b', 2, '10:00'), ('c', 3, '12:00'), ('d', 3, '17:30')]:
+            response = self.client.post('/api/scans/demo/', {'request_id': f'gap-{key}', 'employee_id': 1, 'facility_id': facility, 'occurred_at': f'2026-10-29T{stamp}:00+07:00'}, format='json')
+            self.assertEqual(response.status_code, 201, response.data)
+        for number, facility, stamp in [(1, 1, '09:30'), (2, 2, '11:30')]:
+            payload = {'request_id': f'missing-{number}', 'employee_id': 1, 'date': '2026-10-29', 'facility_id': facility, 'event_type': 'OUT', 'occurred_at': f'2026-10-29T{stamp}:00+07:00', 'reason': 'Quên chấm ra'}
+            result = self.client.post('/api/requests/add-event/', payload, format='json')
+            self.assertEqual(result.status_code, 201, result.data)
+            item = result.data['request']
+            reviewed = self.client.post(f"/api/requests/{item['id']}/review/", {'decision': 'APPROVED', 'review_note': 'Đã xác minh', 'expected_version': item['version']}, format='json')
+            self.assertEqual(reviewed.status_code, 200, reviewed.data)
+        row = next(r for r in self.client.get('/api/work-days/?date=2026-10-29').data if r['employee_id'] == 1)
+        self.assertEqual(row['work_minutes'], 480)
+
+    def test_month_incomplete_uses_demo_clock(self):
+        self.client.post('/api/schedules/demo-create/', {'employee_id': 1, 'work_date': '2026-11-10'}, format='json')
+        before = self.client.get('/api/work-months/?month=2026-11&as_of=2026-11-10T09:00:00%2B07:00')
+        after = self.client.get('/api/work-months/?month=2026-11&as_of=2026-11-10T18:00:00%2B07:00')
+        self.assertEqual(next(r for r in before.data if r['employee_id'] == 1)['incomplete_count'], 0)
+        self.assertEqual(next(r for r in after.data if r['employee_id'] == 1)['incomplete_count'], 1)
+
+    def test_forgot_first_scan_can_correct_inferred_direction_then_add_in(self):
+        self.client.post('/api/schedules/demo-create/', {'employee_id': 1, 'work_date': '2026-10-29'}, format='json')
+        scan = self.client.post('/api/scans/demo/', {'request_id': 'forgot-in', 'employee_id': 1, 'facility_id': 1, 'occurred_at': '2026-10-29T17:30:00+07:00'}, format='json').data['scan']
+        self.assertEqual(scan['event_type'], 'IN')
+        payload = {'request_id': 'fix-direction', 'employee_id': 1, 'date': '2026-10-29', 'facility_id': 1, 'event_type': 'OUT', 'occurred_at': '2026-10-29T17:30:00+07:00', 'reason': 'Thực tế đây là lượt ra', 'target_scan_id': scan['id']}
+        replacement = self.client.post('/api/requests/add-event/', payload, format='json')
+        self.assertEqual(replacement.status_code, 201, replacement.data)
+        self.assertEqual(replacement.data['request']['request_type'], 'REPLACE_EVENT')
+        item = replacement.data['request']
+        result = self.client.post(f"/api/requests/{item['id']}/review/", {'decision': 'APPROVED', 'review_note': 'Đã kiểm tra', 'expected_version': item['version']}, format='json')
+        self.assertEqual(result.status_code, 200, result.data)
+        payload = {'request_id': 'add-missing-in', 'employee_id': 1, 'date': '2026-10-29', 'facility_id': 1, 'event_type': 'IN', 'occurred_at': '2026-10-29T08:30:00+07:00', 'reason': 'Quên chấm vào'}
+        item = self.client.post('/api/requests/add-event/', payload, format='json').data['request']
+        result = self.client.post(f"/api/requests/{item['id']}/review/", {'decision': 'APPROVED', 'review_note': 'Đã kiểm tra', 'expected_version': item['version']}, format='json')
+        self.assertEqual(result.status_code, 200, result.data)
+        row = next(r for r in self.client.get('/api/work-days/?date=2026-10-29').data if r['employee_id'] == 1)
+        self.assertEqual(row['work_minutes'], 480)
+        self.assertEqual(AttendanceScan.objects.get(pk=scan['id']).event_type, 'IN')
+
+class DefaultScheduleTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        seed_database()
+
+    def setUp(self):
+        self.client = APIClient()
+        self.today = timezone.now().astimezone(__import__('zoneinfo').ZoneInfo('Asia/Ho_Chi_Minh')).date()
+        self.tomorrow = self.today + timedelta(days=1)
+
+    def test_creates_and_reuses_daily_defaults_and_preserves_cancelled(self):
+        payload = {'work_date': self.tomorrow.isoformat()}
+        first = self.client.post('/api/schedules/defaults/', payload, format='json')
+        self.assertEqual(first.status_code, 200, first.data)
+        self.assertEqual(first.data['created'], 100)
+        schedule = WorkSchedule.objects.get(employee_id=1, work_date=self.tomorrow)
+        self.assertEqual(schedule.starts_at.astimezone(__import__('zoneinfo').ZoneInfo('Asia/Ho_Chi_Minh')).strftime('%H:%M'), '08:30')
+        self.assertEqual(schedule.ends_at.astimezone(__import__('zoneinfo').ZoneInfo('Asia/Ho_Chi_Minh')).strftime('%H:%M'), '17:30')
+        WorkSchedule.objects.filter(pk=schedule.pk).update(status='CANCELLED')
+        second = self.client.post('/api/schedules/defaults/', payload, format='json')
+        self.assertEqual(second.data['created'], 0)
+        self.assertEqual(WorkSchedule.objects.get(pk=schedule.pk).status, 'CANCELLED')
+        self.assertEqual(WorkSchedule.objects.filter(work_date=self.tomorrow).count(), 100)
+
+    def test_skips_inactive_and_not_yet_hired_and_never_generates_historical(self):
+        Employee.objects.filter(pk=1).update(status='INACTIVE')
+        Employee.objects.filter(pk=2).update(hired_on=self.tomorrow + timedelta(days=1))
+        result = self.client.post('/api/schedules/defaults/', {'work_date': self.tomorrow.isoformat()}, format='json')
+        self.assertEqual(result.status_code, 200, result.data)
+        self.assertEqual(result.data['created'], 98)
+        yesterday = self.today - timedelta(days=1)
+        self.assertEqual(self.client.post('/api/schedules/defaults/', {'work_date': yesterday.isoformat()}, format='json').status_code, 400)
+
+    def test_scan_creates_own_default_without_opening_frontend(self):
+        stamp = f'{self.tomorrow.isoformat()}T08:30:00+07:00'
+        result = self.client.post('/api/scans/demo/', {'request_id': 'automatic-schedule', 'employee_id': 1, 'facility_id': 1, 'occurred_at': stamp}, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertNotIn('NO_SCHEDULE', result.data['warnings'])
+        self.assertTrue(WorkSchedule.objects.filter(employee_id=1, work_date=self.tomorrow, status='SCHEDULED').exists())
+
+    @override_settings(DEMO_MODE=False)
+    def test_defaults_are_disabled_outside_demo(self):
+        self.assertEqual(self.client.post('/api/schedules/defaults/', {'work_date': self.tomorrow.isoformat()}, format='json').status_code, 403)
+
+    def test_scan_does_not_recreate_a_cancelled_schedule(self):
+        self.client.post('/api/schedules/demo-create/', {'employee_id': 1, 'work_date': self.tomorrow.isoformat()}, format='json')
+        WorkSchedule.objects.filter(employee_id=1, work_date=self.tomorrow).update(status='CANCELLED')
+        result = self.client.post('/api/scans/demo/', {'request_id': 'cancelled-auto', 'employee_id': 1, 'facility_id': 1, 'occurred_at': f'{self.tomorrow.isoformat()}T08:30:00+07:00'}, format='json')
+        self.assertEqual(result.status_code, 201, result.data)
+        self.assertIn('NO_SCHEDULE', result.data['warnings'])
+        self.assertEqual(WorkSchedule.objects.get(employee_id=1, work_date=self.tomorrow).status, 'CANCELLED')
+
+class ConcurrentDefaultScheduleTests(TransactionTestCase):
+    def setUp(self):
+        seed_database()
+
+    def tearDown(self):
+        tables = ['audit_logs', 'attendance_requests', 'attendance_scans', 'attendance_alerts', 'qr_challenges',
+                  'support_assignments', 'work_schedules', 'users', 'employees', 'facilities']
+        with connection.cursor() as cursor:
+            for table in tables:
+                cursor.execute(f'DELETE FROM {table}')
+
+    def test_parallel_initialization_does_not_duplicate(self):
+        from zoneinfo import ZoneInfo
+        from .support_services import ensure_default_schedules
+        day = timezone.now().astimezone(ZoneInfo('Asia/Ho_Chi_Minh')).date() + timedelta(days=1)
+        barrier = Barrier(2)
+        def initialize():
+            close_old_connections()
+            try:
+                barrier.wait(timeout=5)
+                return ensure_default_schedules(day)['created']
+            finally:
+                close_old_connections()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            counts = list(pool.map(lambda _: initialize(), range(2)))
+        self.assertEqual(sorted(counts), [0, 100])
+        self.assertEqual(WorkSchedule.objects.filter(work_date=day).count(), 100)
